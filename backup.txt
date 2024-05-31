@@ -1,0 +1,373 @@
+"use strict";
+
+const canvas = document.querySelector("canvas");
+
+//initialize the gpu, here so await works
+if (!navigator.gpu){
+  throw new Error("WebGPU not supported on this browser.");
+}
+
+const adapter = await navigator.gpu.requestAdapter();
+if (!adapter) {
+  throw new Error("No appropriate GPUAdapter found.");
+}
+const device = await adapter.requestDevice();
+//define grid size as constant
+const GRID_SIZE = 32;
+const UPDATE_INTERVAL = 100; // Update every 200ms (5 times/sec)
+let step = 0; // Track how many simulation steps have been run
+const WORKGROUP_SIZE = 8; // compute shader workgroup size
+
+//surface geometry of cornell box
+let date = new Date();
+let camera = [
+  278, 273, -100, date.getMilliseconds(),
+];
+const floorQuad = [
+  552.8, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 559.2, 0.0,
+  549.6, 0.0, 559.2, 0.0,
+];
+const lightPos = [
+  343.0, 548.8, 227.0, 0.0,
+];
+const ceilingQuad = [
+  556.0, 548.8, 0.0, 0.0,
+  556.0, 548.8, 559.2, 0.0,
+  0.0, 548.8, 559.2, 0.0,
+  0.0, 548.8, 0.0, 0.0,
+];
+const backWallQuad = [
+  549.6, 0.0, 559.2, 0.0,
+  0.0, 0.0, 559.2, 0.0,
+  0.0, 548.8, 559.2, 0.0,
+  556.0, 548.8, 559.2, 0.0,
+];
+const rightWallQuad = [ //green
+  0.0, 0.0, 559.2, 0.0,
+  0.0, 0.0, 0.0, 0.0,
+  0.0, 548.8, 0.0, 0.0,
+  0.0, 548.8, 559.2, 0.0,
+];
+const leftWallQuad = [ //red
+  552.8, 0.0, 0.0,  0.0,
+  549.6, 0.0, 559.2, 0.0,
+  556.0, 548.8, 559.2, 0.0,
+  556.0, 548.8, 0.0, 0.0,
+];
+
+function main() {
+  //initialize the context
+  /*One big difference in how WebGPU works compared to WebGL is that because canvas configuration 
+  is separate from device creation you can have any number of canvases that are all being rendered 
+   by a single device! This will make certain use cases, like multi-pane 3D editors, much easier to develop. */
+  const context = canvas.getContext("webgpu");
+  const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({
+    device: device,
+    format: canvasFormat,
+  });
+
+  //geometry
+  const vertices = new Float32Array([ // square covering the canvas
+    //   X,    Y,
+    -1.0, -1.0, // Triangle 1 (Blue)
+    1.0, -1.0,
+    1.0,  1.0,
+
+    -1.0, -1.0, // Triangle 2 (Red)
+    1.0,  1.0,
+    -1.0,  1.0,
+  ]);
+  const vertexBuffer = device.createBuffer({ //kinda like a vao
+    label: "Cell vertices",
+    size: vertices.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vertexBuffer, /*bufferOffset=*/0, vertices); //kinda like bufferSubData
+  const vertexBufferLayout = {
+    arrayStride: 8,
+    attributes: [{
+      format: "float32x2",
+      offset: 0,
+      shaderLocation: 0, // Position, see vertex shader
+    }],
+  };
+
+  const bindGroupLayout = device.createBindGroupLayout({
+    label: "Cell Bind Group Layout",
+    entries: [{
+      binding: 0,
+      // Add GPUShaderStage.FRAGMENT here if you are using the `grid` uniform in the fragment shader.
+      visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+      buffer: {} // Grid uniform buffer, blank because uniform is default
+    }, {
+      binding: 1,
+      visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+      buffer: { type: "read-only-storage"} // Cell state input buffer
+    }, {
+      binding: 2,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "storage"} // Cell state output buffer
+    }]
+  });
+
+  const pipelineLayout = device.createPipelineLayout({
+    label: "Cell Pipeline Layout",
+    bindGroupLayouts: [ bindGroupLayout ],
+  });
+
+  //end geometry
+
+  // start shaders
+  const cellShaderModule = device.createShaderModule({
+    label: "render pass shader",
+    code: `
+    // structs
+    struct VertexInput {
+      @location(0) pos: vec2f,
+      @builtin(instance_index) instance: u32,
+    };
+    
+    struct VertexOutput {
+      @builtin(position) pos: vec4f,
+      @location(0) cell: vec2f,
+    };
+    
+
+    //ubo binding
+    @group(0) @binding(0) var<uniform> grid: vec2f;
+    @group(0) @binding(1) var<storage> cellState: array<u32>;
+
+
+      @vertex
+      fn vertexMain(input: VertexInput) -> VertexOutput {
+
+          let i = f32(input.instance); // casting as float
+          let cell = vec2f(i % grid.x, floor(i / grid.x));
+          let state = f32(cellState[input.instance]);
+
+          let cellOffset = (cell / grid) * 2;
+          let gridPos = (input.pos * state + 1) / grid - 1 + cellOffset;
+
+          var output: VertexOutput;
+          output.pos = vec4f(gridPos, 0, 1);
+          output.cell = cell;
+          return output;
+      }
+
+      // fragment shader
+
+      struct FragInput {
+        @location(0) cell: vec2f,
+      };
+
+      @fragment
+      
+      fn fragmentMain(input: FragInput) -> @location(0) vec4f {
+        let c = input.cell / grid;
+        return vec4f(c.x, c.y, 1.414- (c.x + c.y ), 1); // (Red, Green, Blue, Alpha)
+      }
+    `
+  });
+
+  // Create the compute shader that will process the simulation.
+  const simulationShaderModule = device.createShaderModule({
+    label: "Game of Life simulation shader",
+    code: `
+      @group(0) @binding(0) var<uniform> grid: vec2f; 
+
+      @group(0) @binding(1) var<storage> cellStateIn: array<u32>; //can have both buffers at the same time in a compute shader
+      @group(0) @binding(2) var<storage, read_write> cellStateOut: array<u32>; //no write only so have to have it read_write, effectively output
+
+      fn cellIndex(cell: vec2u) -> u32 {
+        return (cell.y % u32(grid.y)) * u32(grid.x) + (cell.x % u32(grid.x)); //maps cell's position to index in a big array
+      }
+
+      fn cellActive(x: u32, y: u32) -> u32 {
+        return cellStateIn[cellIndex(vec2(x, y))];
+      }
+
+      @compute
+      @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE}) // passes in the literals from js, 8, 8, 1
+      fn computeMain(@builtin(global_invocation_id) cell: vec3u) {
+        let activeNeighbors = cellActive(cell.x+1, cell.y+1) +
+                        cellActive(cell.x+1, cell.y) +
+                        cellActive(cell.x+1, cell.y-1) +
+                        cellActive(cell.x, cell.y-1) +
+                        cellActive(cell.x-1, cell.y-1) +
+                        cellActive(cell.x-1, cell.y) +
+                        cellActive(cell.x-1, cell.y+1) +
+                        cellActive(cell.x, cell.y+1);
+
+        let i = cellIndex(cell.xy);
+
+        // Conway's game of life rules:
+        switch activeNeighbors {
+          case 2: {
+            cellStateOut[i] = cellStateIn[i];
+          }
+          case 3: {
+            cellStateOut[i] = 1;
+          }
+          default: {
+            cellStateOut[i] = 0;
+          }
+        }
+      }`
+  });
+
+  const cellPipeline = device.createRenderPipeline({
+    label: "Cell pipeline",
+    layout: pipelineLayout,
+    vertex: {
+      module: cellShaderModule,
+      entryPoint: "vertexMain",
+      buffers: [vertexBufferLayout]
+    },
+    fragment: {
+      module: cellShaderModule,
+      entryPoint: "fragmentMain",
+      targets: [{
+        format: canvasFormat
+      }]
+    }
+  });
+
+  // Create a compute pipeline that updates the game state.
+  const simulationPipeline = device.createComputePipeline({
+    label: "Simulation pipeline",
+    layout: pipelineLayout,
+    compute: {
+      module: simulationShaderModule,
+      entryPoint: "computeMain",
+    }
+  });
+
+  // end shaders
+
+  // UBO for grid
+  // Create a uniform buffer that describes the grid.
+  const uniformArray = new Float32Array([GRID_SIZE, GRID_SIZE]);
+  const uniformBuffer = device.createBuffer({
+    label: "Grid Uniforms",
+    size: uniformArray.byteLength,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+
+  // cell state and storage
+  const cellStateArray = new Uint32Array(GRID_SIZE * GRID_SIZE);
+
+  //storage buffer for array
+  const cellStateStorage = [
+  device.createBuffer({
+    label: "Cell State A",
+    size: cellStateArray.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  }),
+  device.createBuffer({
+    label: "Cell State B",
+    size: cellStateArray.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+];
+
+  //randomstate for cellStateArray
+  for (let i = 0; i < cellStateArray.length; ++i) {
+    cellStateArray[i] = Math.random() > 0.6 ? 1 : 0;
+  }
+  device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+
+  //mark every third cell of the grid as active.
+  for (let i = 0;  i < cellStateArray.length; i += 3) {
+    cellStateArray[i] = 1;
+  }
+  device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+
+  //Mark every other cell of the second grid as active.
+  for (let i = 0;  i < cellStateArray.length; i ++) {
+    cellStateArray[i] = i % 2;
+  }
+  device.queue.writeBuffer(cellStateStorage[1], 0, cellStateArray);
+
+  const bindGroups = [
+    device.createBindGroup({
+      label: "Cell renderer bind group A",
+      layout: bindGroupLayout,
+      entries: [{
+        binding: 0,
+        resource: { buffer: uniformBuffer }
+      }, {
+        binding: 1,
+        resource: { buffer: cellStateStorage[0] }
+      }, {
+        binding: 2,
+        resource: { buffer: cellStateStorage[1] }
+      }],
+    }),
+    device.createBindGroup({
+      label: "Cell renderer bind group B",
+      layout: bindGroupLayout,
+      entries: [{
+        binding: 0,
+        resource: { buffer: uniformBuffer }
+      }, {
+        binding: 1,
+        resource: { buffer: cellStateStorage[1] }
+      }, {
+        binding: 2,
+        resource: { buffer: cellStateStorage[0] }
+      }],
+    })
+  ];
+
+  const encoder = device.createCommandEncoder(); //interface for recording gpu commands
+
+  function updateGrid() {
+    const encoder = device.createCommandEncoder();
+
+    //compute pass
+    const computePass = encoder.beginComputePass();
+    
+    computePass.setPipeline(simulationPipeline);
+    computePass.setBindGroup(0, bindGroups[step % 2]);
+
+    const workgroupCount = Math.ceil(GRID_SIZE / WORKGROUP_SIZE); // this can have problems and may have to check in the shader if you're over the the desired global_invocation_id and return early
+    computePass.dispatchWorkgroups(workgroupCount, workgroupCount); //very similar to OpenGL compute shader dispatch
+    
+
+    computePass.end();
+
+    //render pass
+
+    step++;
+
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0.4, a: 1 }, // New line
+        storeOp: "store",
+      }]
+    });
+  
+  
+    //draw the square and grid
+    pass.setPipeline(cellPipeline);
+    pass.setVertexBuffer(0, vertexBuffer);
+    pass.setBindGroup(0, bindGroups[step % 2]); //bind ubo, step % 2 makes sure it's using the correct state buffer
+    pass.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE); // 6 vertices because it's 2 floats per vert
+  
+    pass.end();
+    //const commandBuffer = encoder.finish();
+    //device.queue.submit([commandBuffer]);
+    // Finish the command buffer and immediately submit it.
+    device.queue.submit([encoder.finish()]); // this does what the commented out commands do I think
+  }
+
+  setInterval(updateGrid, UPDATE_INTERVAL);
+}
+
+main();
